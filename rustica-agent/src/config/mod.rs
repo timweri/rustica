@@ -6,6 +6,8 @@ use std::{
 use crate::{RusticaAgentLibraryError, RusticaServer};
 use serde::{Deserialize, Serialize};
 
+pub const DEFAULT_MTLS_CSR_RENEWAL_PERIOD: u64 = 60 * 60 * 24 * 7;
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Options {
     pub principals: Option<Vec<String>>,
@@ -24,10 +26,18 @@ struct Version {
 pub struct Config {
     version: u64,
     pub servers: Vec<RusticaServer>,
+    pub mtls_csr_renewal_period: Option<u64>,
     pub slot: Option<String>,
     pub key: Option<String>,
     pub options: Option<Options>,
     pub socket: Option<String>,
+}
+
+impl Config {
+    pub fn effective_mtls_csr_renewal_period(&self) -> u64 {
+        self.mtls_csr_renewal_period
+            .unwrap_or(DEFAULT_MTLS_CSR_RENEWAL_PERIOD)
+    }
 }
 
 pub struct UpdatableConfiguration {
@@ -101,6 +111,7 @@ fn parse_v1_config(config: &str) -> Result<Config, RusticaAgentLibraryError> {
         pub ca_pem: String,
         pub mtls_cert: String,
         pub mtls_key: String,
+        pub mtls_csr_renewal_period: Option<u64>,
         pub slot: Option<String>,
         pub key: Option<String>,
         pub options: Option<Options>,
@@ -122,6 +133,7 @@ fn parse_v1_config(config: &str) -> Result<Config, RusticaAgentLibraryError> {
     Ok(Config {
         version: 2,
         servers: vec![server_config],
+        mtls_csr_renewal_period: config_v1.mtls_csr_renewal_period,
         slot: config_v1.slot,
         key: config_v1.key,
         options: config_v1.options,

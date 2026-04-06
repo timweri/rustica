@@ -1,4 +1,5 @@
 version = 2
+mtls_csr_renewal_period = 604800 # 1 week, in seconds
 key = """
 -----BEGIN OPENSSH PRIVATE KEY-----
 b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
