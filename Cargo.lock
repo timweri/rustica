@@ -4261,6 +4261,7 @@ dependencies = [
  "hex",
  "log",
  "prost",
+ "rcgen",
  "ring 0.17.13",
  "serde",
  "serde_derive",

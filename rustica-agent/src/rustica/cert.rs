@@ -1,6 +1,7 @@
 use super::error::{RefreshError, ServerError};
 use super::{CertificateRequest, RusticaCert, Signatory};
 use crate::{CertificateConfig, MtlsCredentials, RusticaServer};
+use rcgen::{Certificate as X509Certificate, CertificateParams, KeyPair};
 use sshcerts::Certificate;
 use tokio::runtime::Handle;
 
@@ -8,6 +9,36 @@ use std::collections::HashMap;
 use std::time::SystemTime;
 
 impl RusticaServer {
+    fn create_mtls_refresh_csr(&self) -> Vec<u8> {
+        let mut params = CertificateParams::new(vec![]);
+        let key_pair = match KeyPair::from_pem(&self.mtls_key) {
+            Ok(key_pair) => key_pair,
+            Err(e) => {
+                warn!("Could not parse mTLS key for CSR generation, falling back to legacy renewal flow: {e}");
+                return vec![];
+            }
+        };
+
+        params.alg = key_pair.algorithm();
+        params.key_pair = Some(key_pair);
+
+        let certificate = match X509Certificate::from_params(params) {
+            Ok(certificate) => certificate,
+            Err(e) => {
+                warn!("Could not build mTLS CSR request, falling back to legacy renewal flow: {e}");
+                return vec![];
+            }
+        };
+
+        match certificate.serialize_request_der() {
+            Ok(csr) => csr,
+            Err(e) => {
+                warn!("Could not serialize mTLS CSR, falling back to legacy renewal flow: {e}");
+                vec![]
+            }
+        }
+    }
+
     pub async fn refresh_certificate_async(
         &self,
         signatory: &Signatory,
@@ -32,6 +63,7 @@ impl RusticaServer {
             valid_before: current_timestamp + options.duration,
             valid_after: current_timestamp,
             challenge: Some(challenge),
+            mtls_csr: self.create_mtls_refresh_csr(),
         });
 
         let response = client.certificate(request).await?;

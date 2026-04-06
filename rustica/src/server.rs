@@ -62,12 +62,15 @@ pub struct RusticaServer {
 struct MtlsCertificateInfo {
     identities: Vec<String>,
     expiry_timestamp: i64,
+    subject_public_key: Vec<u8>,
 }
 
 struct CertificateRefreshSettings {
     not_after: u64,
     not_before: u64,
 }
+
+const MAX_MTLS_CSR_SIZE: usize = 4096;
 
 /// Macro for simplifying sending error logs to the Rustica logging system.
 macro_rules! rustica_error {
@@ -111,6 +114,7 @@ fn extract_certificate_information(
     let mut cert_info = MtlsCertificateInfo {
         identities: vec![],
         expiry_timestamp: 0x7FFFFFFFFFFFFFFF,
+        subject_public_key: vec![],
     };
 
     match x509_parser::parse_x509_certificate(peer.as_ref()) {
@@ -120,6 +124,8 @@ fn extract_certificate_information(
             // This is used to automatically refresh the certificate if it's
             // going to expire within a given window
             cert_info.expiry_timestamp = cert.validity().not_after.timestamp();
+            cert_info.subject_public_key =
+                cert.tbs_certificate.subject_pki.subject_public_key.data.to_vec();
 
             // Loop through all the DNs to find the common name as identified by the OID
             for ident in cert.tbs_certificate.subject.iter_rdn() {
@@ -150,7 +156,15 @@ fn validate_request(
     hmac_key: &ring::hmac::Key,
     peer_certs: &Arc<Vec<TonicCertificate>>,
     challenge: &Challenge,
-) -> Result<(PublicKey, Vec<String>, Option<CertificateRefreshSettings>), RusticaServerError> {
+) -> Result<
+    (
+        PublicKey,
+        Vec<String>,
+        Option<CertificateRefreshSettings>,
+        Vec<u8>,
+    ),
+    RusticaServerError,
+> {
     // Only support the presenting of a single client certificate
     // I've never seen anyone handle multiple ones and since we don't
     // need to here, trying to support it will only lead to validation
@@ -304,6 +318,7 @@ fn validate_request(
             hmac_ssh_pubkey,
             cert_info.identities,
             certificate_refresh_settings,
+            cert_info.subject_public_key,
         ));
     }
 
@@ -349,7 +364,33 @@ fn validate_request(
         hmac_ssh_pubkey,
         cert_info.identities,
         certificate_refresh_settings,
+        cert_info.subject_public_key,
     ))
+}
+
+fn build_client_certificate_params(
+    mtls_identities: &[String],
+    settings: &CertificateRefreshSettings,
+) -> rcgen::CertificateParams {
+    let mut params = rcgen::CertificateParams::new(mtls_identities.to_vec());
+    params.not_before = (UNIX_EPOCH + Duration::from_secs(settings.not_before)).into();
+    params.not_after = (UNIX_EPOCH + Duration::from_secs(settings.not_after)).into();
+    params.distinguished_name.push(
+        DnType::CommonName,
+        mtls_identities.first().cloned().unwrap_or_default(),
+    );
+    params
+}
+
+fn extract_csr_public_key(csr: &[u8]) -> Result<Vec<u8>, RusticaServerError> {
+    let (_, csr) = x509_parser::certification_request::X509CertificationRequest::from_der(csr)
+        .map_err(|_| RusticaServerError::BadRequest)?;
+    Ok(csr
+        .certification_request_info
+        .subject_pki
+        .subject_public_key
+        .data
+        .to_vec())
 }
 
 /// Check that mTLS identity is not rate limited for allowed_signers endpoint
@@ -484,7 +525,7 @@ impl Rustica for RusticaServer {
             _ => return Ok(create_response(RusticaServerError::BadRequest)),
         };
 
-        let (ssh_pubkey, mtls_identities, mtls_refresh) =
+        let (ssh_pubkey, mtls_identities, mtls_refresh, mtls_public_key) =
             match validate_request(self, &self.hmac_key, &peer, challenge) {
                 Ok(x) => x,
                 Err(e) => return Ok(create_response(e)),
@@ -611,21 +652,87 @@ impl Rustica for RusticaServer {
             self.signer
                 .get_client_certificate_authority(&self.client_authority.authority),
         ) {
-            let mut params = rcgen::CertificateParams::new(mtls_identities.clone());
-            params.not_before = (UNIX_EPOCH + Duration::from_secs(settings.not_before)).into();
-            params.not_after = (UNIX_EPOCH + Duration::from_secs(settings.not_after)).into();
-            params.distinguished_name.push(
-                DnType::CommonName,
-                mtls_identities
-                    .get(0)
-                    .map(|x| x.to_owned())
-                    .unwrap_or_default(),
-            );
+            if request.mtls_csr.is_empty() {
+                let new_certificate = match rcgen::Certificate::from_params(
+                    build_client_certificate_params(&mtls_identities, settings),
+                ) {
+                    Ok(cert) => cert,
+                    Err(e) => {
+                        rustica_error!(
+                            self,
+                            format!("Could not build replacement mTLS certificate: {e}")
+                        );
+                        return Ok(create_response(RusticaServerError::BadRequest));
+                    }
+                };
 
-            let new_certificate = rcgen::Certificate::from_params(params).unwrap();
+                reply.new_client_key = new_certificate.serialize_private_key_pem();
+                reply.new_client_certificate =
+                    match new_certificate.serialize_pem_with_signer(ca) {
+                        Ok(cert) => cert,
+                        Err(e) => {
+                            rustica_error!(
+                                self,
+                                format!("Could not sign replacement mTLS certificate: {e}")
+                            );
+                            return Ok(create_response(RusticaServerError::BadRequest));
+                        }
+                    };
+            } else {
+                if request.mtls_csr.len() > MAX_MTLS_CSR_SIZE {
+                    rustica_warning!(
+                        self,
+                        format!(
+                            "Oversized mTLS CSR was provided by [{}]. Size: {} bytes",
+                            mtls_identities.join(","),
+                            request.mtls_csr.len(),
+                        )
+                    );
+                    return Ok(create_response(RusticaServerError::BadRequest));
+                }
 
-            reply.new_client_key = new_certificate.serialize_private_key_pem();
-            reply.new_client_certificate = new_certificate.serialize_pem_with_signer(ca).unwrap();
+                let csr_public_key = match extract_csr_public_key(&request.mtls_csr) {
+                    Ok(key) => key,
+                    Err(e) => return Ok(create_response(e)),
+                };
+
+                if csr_public_key != mtls_public_key {
+                    rustica_warning!(
+                        self,
+                        format!(
+                            "mTLS CSR public key did not match presented mTLS certificate for {}",
+                            mtls_identities.join(",")
+                        )
+                    );
+                    return Ok(create_response(RusticaServerError::NotAuthorized));
+                }
+
+                let mut csr = match rcgen::CertificateSigningRequest::from_der(&request.mtls_csr) {
+                    Ok(csr) => csr,
+                    Err(e) => {
+                        rustica_warning!(
+                            self,
+                            format!(
+                                "Invalid mTLS CSR was provided by [{}]. Error: [{e}]",
+                                mtls_identities.join(","),
+                            )
+                        );
+                        return Ok(create_response(RusticaServerError::BadRequest));
+                    }
+                };
+
+                csr.params = build_client_certificate_params(&mtls_identities, settings);
+                reply.new_client_certificate = match csr.serialize_pem_with_signer(ca) {
+                    Ok(cert) => cert,
+                    Err(e) => {
+                        rustica_error!(
+                            self,
+                            format!("Could not sign renewed mTLS certificate: {e}")
+                        );
+                        return Ok(create_response(RusticaServerError::BadRequest));
+                    }
+                };
+            }
         };
 
         let _ = self
@@ -665,7 +772,7 @@ impl Rustica for RusticaServer {
             _ => return Err(Status::permission_denied("")),
         };
 
-        let (ssh_pubkey, mtls_identities, _) =
+        let (ssh_pubkey, mtls_identities, _, _) =
             match validate_request(self, &self.hmac_key, &peer, challenge) {
                 Ok(x) => x,
                 Err(e) => {
@@ -769,7 +876,7 @@ impl Rustica for RusticaServer {
             _ => return Err(Status::permission_denied("")),
         };
 
-        let (ssh_pubkey, mtls_identities, _) =
+        let (ssh_pubkey, mtls_identities, _, _) =
             match validate_request(self, &self.hmac_key, &peer, challenge) {
                 Ok(x) => x,
                 Err(e) => return Err(Status::cancelled(format!("{:?}", e))),
